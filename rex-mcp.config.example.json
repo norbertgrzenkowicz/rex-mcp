@@ -1,0 +1,8 @@
+{
+  "writeAllowlist": [],
+  "unblockMethods": [],
+  "allowLua": false,
+  "allowClientActions": false,
+  "stateFile": ".state/owned.json",
+  "rexPath": "rex"
+}

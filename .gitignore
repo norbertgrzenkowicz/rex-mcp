@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.state/
+rex-mcp.config.json
+.prompt*.txt
+.turn*.err
+.turn*.json
