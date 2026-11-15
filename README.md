@@ -93,7 +93,7 @@ claude mcp add rex -- ssh <host> node <path>/dist/stdio.js
 Over HTTP for remote assistants:
 
 ```sh
-uvx mcp-proxy --host <tailnet-ip> --port 8787 -- node <path>/dist/stdio.js
+uvx mcp-proxy --host <listen-ip> --port 8787 -- node <path>/dist/stdio.js
 ```
 
 ## Config

@@ -1,8 +1,8 @@
 # rex-mcp design
 
-rex-mcp is an MCP server that lets a remote AI assistant see and manage a Rex
-server. The assistant reaches the machine over SSH and starts the server over
-stdio. Every Rex operation goes through the `rex` CLI. The CLI is Rex's
+rex-mcp is an MCP server that lets an AI assistant see and manage a Rex
+server. The assistant starts it over stdio, either locally or on the Rex
+machine over SSH, or reaches it through an HTTP proxy such as mcp-proxy. Every Rex operation goes through the `rex` CLI. The CLI is Rex's
 supported surface, and the socket protocol behind it is not documented.
 
 ## Layers
