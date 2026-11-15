@@ -87,6 +87,11 @@ function scope(ctx: Ctx): string[] {
   ];
 }
 
+async function pruneOwned(ctx: Ctx): Promise<void> {
+  const { sessions } = await ctx.rex.json<{ sessions: { session_id: string }[] }>(["ls", "--json"]);
+  ctx.owned.prune(new Set(sessions.map((s) => parseSessionId(s.session_id))));
+}
+
 async function liveSessions(ctx: Ctx) {
   const { sessions } = await ctx.rex.json<{ sessions: { session_id: string; label: string }[] }>(["ls", "--json"]);
   ctx.owned.prune(new Set(sessions.map((s) => parseSessionId(s.session_id))));
@@ -134,7 +139,7 @@ export const tools: Tool[] = [
       const [whoami, version] = await Promise.all([
         ctx.rex.json(["whoami", "--json"]),
         ctx.rex.json(["api", "call", "server.version"]),
-        liveSessions(ctx),
+        pruneOwned(ctx),
       ]);
       const { writeAllowlist, unblockMethods, allowLua, allowClientActions, server } = ctx.config;
       return {
@@ -429,7 +434,7 @@ export const tools: Tool[] = [
       client: z.string().optional(),
     },
     async handler(a, ctx) {
-      if (!a.name === !a.script) throw new Error("input: give exactly one of `name` or `script`");
+      if (Boolean(a.name) === Boolean(a.script)) throw new Error("input: give exactly one of `name` or `script`");
       const sessions = ctx.target.session ? [ctx.target.session] : [];
       const tail = [...(a.args ? ["--args", JSON.stringify(a.args)] : []), ...scope(ctx), "--json"];
       if (a.script) {

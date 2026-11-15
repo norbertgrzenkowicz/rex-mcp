@@ -7,29 +7,86 @@ allowlist.
 
 ## Install
 
-Copy this prompt into your AI assistant (Claude Code, OpenCode, Codex, Grok Bot
+Copy this prompt into your AI assistant (Claude Code, OpenCode, Codex, Cursor
 or any other assistant that can run shell commands and register MCP servers)
 on the machine that runs Rex:
 
 ```text
-Install the rex-mcp MCP server from https://github.com/norbertgrzenkowicz/rex-mcp and register it with yourself. Steps:
+Install the rex-mcp MCP server from https://github.com/norbertgrzenkowicz/rex-mcp and add it to your own MCP configuration. Steps:
 
-1. Check prerequisites and stop with a clear message if one is missing:
-   - `node --version` is 26 or newer.
+1. Check prerequisites and fix or stop with a clear message if one is missing:
+   - `node --version` is 26 or newer. If it is older, install Node 26 first (for example `nvm install 26 && nvm use 26`) and ask me which version manager I use if unsure.
    - `rex` is on PATH (`command -v rex`) and a Rex server is running (`rex ls --json` succeeds).
    - `git` and `npm` are available.
 2. Clone the repo to ~/rex-mcp (or ask me for another path) and build it:
    git clone https://github.com/norbertgrzenkowicz/rex-mcp.git ~/rex-mcp
-   cd ~/rex-mcp && npm ci && npm run build
-3. Copy the example config if no config exists yet:
+   cd ~/rex-mcp && npm ci
+   `npm ci` builds `dist/` through the `prepare` script.
+3. In the clone directory, copy the example config if no config exists yet:
    cp -n rex-mcp.config.example.json rex-mcp.config.json
    Leave the defaults (writeAllowlist empty, allowLua false, allowClientActions false) unless I ask otherwise.
-4. Register an MCP server named "rex" in your own MCP config as a stdio server with command `node` and argument `<absolute path to the clone>/dist/stdio.js`. Use your CLI if you have one (for Claude Code: `claude mcp add rex -- node <path>/dist/stdio.js`), otherwise edit your MCP config file. Show me the change you made.
-5. Optional, only if I say I want remote assistants to reach it over HTTP: run
-   uvx mcp-proxy --host <ip-to-listen-on> --port 8787 -- node <path>/dist/stdio.js
-   and tell me the URLs (http://<ip-to-listen-on>:8787/mcp for streamable HTTP, /sse for SSE). Ask me which IP to bind to; never bind to a public interface without asking.
-6. Verify: reload MCP servers if needed, then call the `rex_status` tool and the `rex_list` tool with kind "sessions". Report the Rex server version and the session count. Do not send text, run commands or kill anything in existing sessions.
+4. Register an MCP server named "rex" in your own MCP config as a stdio server with command `node` and argument `~/rex-mcp/dist/stdio.js`, written as an absolute path. Use your CLI if you have one (for Claude Code: `claude mcp add rex -- node "$HOME/rex-mcp/dist/stdio.js"`), otherwise edit your MCP config file. Show me the change you made.
+5. Optional, only if I say I want remote assistants to reach it over HTTP: this needs `uv` (`brew install uv` or `pipx install uv`). Run
+   uvx mcp-proxy --host <listen-ip> --port 8787 -- node ~/rex-mcp/dist/stdio.js
+   and tell me the URLs (http://<listen-ip>:8787/mcp for streamable HTTP, /sse for SSE). Plain HTTP has no authentication, so it belongs on localhost or a private network. Ask me which IP to bind to; never bind to a public interface without asking.
+6. Verify: restart your MCP client, then call the `rex_status` tool and the `rex_list` tool with kind "sessions". Report the Rex server version and the session count. Do not send text, run commands or kill anything in existing sessions.
 ```
+
+### Manual install
+
+Requires Node 26 or newer and `rex` on `PATH`.
+
+```sh
+git clone https://github.com/norbertgrzenkowicz/rex-mcp.git /path/to/rex-mcp
+cd /path/to/rex-mcp
+npm ci
+cp -n rex-mcp.config.example.json rex-mcp.config.json
+claude mcp add rex -- node "$PWD/dist/stdio.js"
+```
+
+Any other MCP client: add this entry to your MCP configuration and point
+`args` at your clone.
+
+```json
+{
+  "mcpServers": {
+    "rex": {
+      "command": "node",
+      "args": ["/path/to/rex-mcp/dist/stdio.js"]
+    }
+  }
+}
+```
+
+From another machine over SSH:
+
+```sh
+claude mcp add rex -- ssh <host> node /path/to/rex-mcp/dist/stdio.js
+```
+
+Over HTTP for remote assistants, on the Rex machine:
+
+```sh
+uvx mcp-proxy --host <listen-ip> --port 8787 -- node /path/to/rex-mcp/dist/stdio.js
+```
+
+Plain HTTP has no authentication. Bind it to localhost or a private network.
+
+### Update
+
+```sh
+cd /path/to/rex-mcp
+git pull
+npm ci
+```
+
+`npm ci` runs the `prepare` script, which rebuilds `dist/`.
+
+### Remove
+
+Remove the server from your MCP client (`claude mcp remove rex`, or delete the
+`rex` entry from your MCP configuration), then delete the clone if you no
+longer need it.
 
 ## What it does
 
@@ -37,6 +94,9 @@ rex-mcp speaks MCP over stdio and runs every Rex operation through the `rex`
 CLI, the supported Rex surface. An assistant on another machine can start it
 over SSH, or reach it over HTTP through a proxy such as `mcp-proxy`.
 [DESIGN.md](DESIGN.md) has the full design.
+
+Then ask your assistant to capture the last lines of a block, start a session
+and run the test suite in it, or wait for a long job to exit.
 
 ## Tools
 
@@ -52,7 +112,10 @@ DESIGN.md describes each tool's arguments.
 
 ## Safety model
 
-- Reads are always allowed, on any session.
+- Reads are always allowed, on any session. `rex_capture` returns terminal
+  scrollback, so a connected assistant can read anything a session has
+  printed, including secrets. Connect it only to an assistant you trust with
+  that machine.
 - Writes need a target session that rex-mcp created or that `writeAllowlist`
   names. A write without a session is refused.
 - Sessions created through rex-mcp are owned. Ownership survives restarts
@@ -68,33 +131,6 @@ DESIGN.md describes each tool's arguments.
 
 A refused call returns an MCP tool error whose text starts with `policy:` and
 names the rule.
-
-## Manual install
-
-Requires Node 26 or newer and `rex` on `PATH`.
-
-```sh
-git clone https://github.com/norbertgrzenkowicz/rex-mcp.git
-cd rex-mcp
-npm ci && npm run build
-cp rex-mcp.config.example.json rex-mcp.config.json
-claude mcp add rex -- node "$PWD/dist/stdio.js"
-```
-
-Other assistants: register a stdio server with command `node` and argument
-`<path>/dist/stdio.js`.
-
-From another machine over SSH:
-
-```sh
-claude mcp add rex -- ssh <host> node <path>/dist/stdio.js
-```
-
-Over HTTP for remote assistants:
-
-```sh
-uvx mcp-proxy --host <listen-ip> --port 8787 -- node <path>/dist/stdio.js
-```
 
 ## Config
 
