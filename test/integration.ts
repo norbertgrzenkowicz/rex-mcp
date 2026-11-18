@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -174,18 +174,54 @@ try {
   });
 
   let exitBlock = "";
+  let keptBlock = "";
   await check("rex_run", async () => {
     const run = await call("rex_run", {
       session: sessionId, command: ["sh", "-c", "sleep 1; exit 3"], keep_open: true, label: "exit3",
     });
     exitBlock = run.block_ids[0];
     assert(exitBlock?.startsWith("block:"), "run returns the new block ID");
-    const waited = await call("rex_run", { session: sessionId, command: ["sh", "-c", "exit 5"], keep_open: true, wait_seconds: 15 });
-    assert(waited.wait.exit_code === 5, `run with wait_seconds reports exit 5, got ${JSON.stringify(waited.wait)}`);
-    const split = await call("rex_run", {
-      session: sessionId, command: ["true"], split: "right", anchor_block: blockId, ratio: 30, wait_seconds: 10,
+    assert(run.closed === false, "a run without wait_seconds does not close the block");
+    const waited = await call("rex_run", {
+      session: sessionId, command: ["sh", "-c", "echo KEPT_MARKER; exit 5"], keep_open: true, wait_seconds: 15,
     });
-    assert(split.wait.exit_code === 0, "split run beside the first block exits 0");
+    keptBlock = waited.block_ids[0];
+    assert(waited.wait.exit_code === 5, `run with wait_seconds reports exit 5, got ${JSON.stringify(waited.wait)}`);
+    assert(waited.closed === false && String(waited.output).includes("KEPT_MARKER"), "keep_open returns output and leaves the block");
+    const windowsBefore = (await call("rex_list", { kind: "windows", session: sessionId })).windows.length;
+    const auto = await call("rex_run", {
+      session: sessionId, command: ["sh", "-c", "echo AUTOCLOSE_MARKER"], wait_seconds: 15, label: "auto-close",
+    });
+    assert(auto.closed === true && auto.wait.exit_code === 0, `waited run closes by default, got ${JSON.stringify(auto)}`);
+    assert(String(auto.output).includes("AUTOCLOSE_MARKER"), "waited run returns the command output");
+    const afterAuto = await call("rex_list", { kind: "blocks", session: sessionId });
+    assert(!afterAuto.blocks.some((b: any) => b.block_id === auto.block_ids[0]), "auto-closed block is gone");
+    const windowsAfter = (await call("rex_list", { kind: "windows", session: sessionId })).windows.length;
+    assert(windowsAfter === windowsBefore, `auto-close left a window behind (${windowsBefore} -> ${windowsAfter})`);
+    const split = await call("rex_run", {
+      session: sessionId, command: ["sh", "-c", "echo SPLIT_MARKER"], split: "right", anchor_block: blockId, ratio: 30, wait_seconds: 15,
+    });
+    assert(split.closed === true && split.wait.exit_code === 0 && String(split.output).includes("SPLIT_MARKER"), "split run closes only its block");
+    const splitBlocks = await call("rex_list", { kind: "blocks", session: sessionId });
+    assert(splitBlocks.blocks.some((b: any) => b.block_id === blockId), "split auto-close leaves the anchor block");
+    assert(!splitBlocks.blocks.some((b: any) => b.block_id === split.block_ids[0]), "split block is gone");
+    const hung = await call("rex_run", { session: sessionId, command: ["sleep", "30"], wait_seconds: 2, label: "still-running" });
+    assert(hung.wait.timed_out === true && hung.closed === false, `a timed-out run stays open, got ${JSON.stringify(hung)}`);
+    await call("rex_block_close", { session: sessionId, block: hung.block_ids[0] });
+    const close = spawnSync(process.execPath, [join(ROOT, "dist/stdio.js"), "close"], {
+      encoding: "utf8",
+      env: { ...env, REX_MCP_CONFIG: configPath, REX_SESSION: sessionId!, REX_BLOCK: keptBlock, TMUX: "", TMUX_PANE: "" },
+    });
+    if (close.status === 0) {
+      const body = JSON.parse(close.stdout);
+      assert(body.closed === true && body.session_killed === false, `close CLI killed more than its block: ${close.stdout}`);
+      const left = await call("rex_list", { kind: "blocks", session: sessionId });
+      assert(!left.blocks.some((b: any) => b.block_id === keptBlock), "close CLI removed the kept block");
+    } else if (/protected-remote-control|protected-tmux/.test(close.stderr ?? "")) {
+      await call("rex_block_close", { session: sessionId, block: keptBlock });
+    } else {
+      throw new Error(`rex-mcp close failed: status ${close.status} ${close.stderr} ${close.stdout}`);
+    }
   });
 
   await check("rex_wait", async () => {
@@ -244,6 +280,23 @@ try {
   if (foreign) {
     // Empty text: if the gate ever broke, rex would still type nothing into the user's session.
     await refused("send_text-preexisting", "rex_send_text", { session: foreign.session_id, text: "" }, "write-session");
+    const foreignBlock = foreign.blocks[0]?.block_id;
+    if (foreignBlock) {
+      const attack = spawnSync(process.execPath, [join(ROOT, "dist/stdio.js"), "close"], {
+        encoding: "utf8",
+        env: {
+          ...env,
+          REX_MCP_CONFIG: configPath,
+          REX_SESSION: foreign.session_id,
+          REX_BLOCK: foreignBlock,
+          TMUX: "",
+          TMUX_PANE: "",
+        },
+      });
+      const refusedClose = attack.status === 2 && (attack.stderr ?? "").includes("refused");
+      if (refusedClose) policyLines.push("PASS policy:close-preexisting");
+      else policyLines.push(`FAIL policy:close-preexisting: expected a refusal, got status=${attack.status} ${attack.stderr?.slice(0, 200)}`);
+    }
   }
   // if_idle: a broken gate still could not stop a server that has sessions.
   await refused("api_call-server.stop", "rex_api_call", { method: "server.stop", args: { if_idle: true } }, "blocked-method");
@@ -290,7 +343,7 @@ const ok =
   failures.size === 0 &&
   TOOLS.every((t) => passed.has(t)) &&
   policyLines.every((l) => l.startsWith("PASS")) &&
-  policyLines.length === (foreign ? 5 : 4) &&
+  policyLines.length === (foreign ? 5 : 4) + (foreign?.blocks[0] ? 1 : 0) &&
   snapshotOk &&
   leftovers.length === 0;
 process.exit(ok ? 0 : 1);

@@ -80,7 +80,27 @@ git pull
 npm ci
 ```
 
-`npm ci` runs the `prepare` script, which rebuilds `dist/`.
+`npm ci` runs the `prepare` script, which rebuilds `dist/`. Restart the
+process that is serving the old build. On the machine that publishes rex-mcp
+over HTTP, that process is the systemd user service `rex-mcp-http`
+(`uvx mcp-proxy` in front of `node …/dist/stdio.js`):
+
+```sh
+systemctl --user cat rex-mcp-http
+```
+
+`ExecStart` names the install. In that directory, after the pull above:
+
+```sh
+systemctl --user restart rex-mcp-http
+systemctl --user status rex-mcp-http --no-pager
+journalctl --user -u rex-mcp-http -n 40 --no-pager
+```
+
+`git pull` does not restart the service. If the unit sets `REX_MCP_CONFIG`,
+a `rex-mcp close` hook has to set it too, or the hook will not see the same
+ownership file. `systemctl --user show rex-mcp-http -p Environment -p EnvironmentFiles`
+prints what the service sets.
 
 ### Remove
 
@@ -110,6 +130,51 @@ and run the test suite in it, or wait for a long job to exit.
 
 DESIGN.md describes each tool's arguments.
 
+## Closing blocks when the work finishes
+
+A one-off command goes through `rex_run` with `wait_seconds`. The call waits for the command, returns its screen output, and closes the block. Rex closes the window as well when that block was the last one in it. Set `keep_open` to `true` to leave the block up after it exits. That is the opt-out for a dev server or an interactive agent.
+
+Without `wait_seconds`, `rex_run` returns as soon as the block exists. The block stays while the program runs. Rex closes it when the program exits, unless `keep_open` is true. A wait that times out leaves the block running; close it with `rex_block_close` if you are done with it.
+
+Nothing is closed for being idle. A long-lived program (Claude Code, OpenCode, a server) stays until it exits or its creator closes it.
+
+When that program is finished it can close the block it is running in:
+
+```sh
+node /path/to/rex-mcp/dist/stdio.js close
+```
+
+`rex-mcp close` does the same thing when the install is on `PATH`. It only closes the block named by `REX_BLOCK` in the session named by `REX_SESSION` (the variables Rex sets inside a terminal). It takes no target argument. It refuses, and does not change anything, when:
+
+- those variables are missing
+- a parent process is `claude --remote-control` or `claude remote-control`
+- it is running under tmux session `claude-rc`
+- the session label is `wispy-fjord`, or a label in `protectedSessionLabels`
+- the session was not created by rex-mcp and this block was not created by it
+
+If the session was created by rex-mcp and this was its last block, the session is destroyed too. An allowlisted session is never destroyed; only a block rex-mcp created there is closed.
+
+Claude Code can run it when a session ends. This belongs in the user or project settings on the Rex machine. `Stop` fires after every turn, so it closes the block while the agent is still in use. `SessionEnd` fires when the Claude session exits:
+
+```json
+{
+  "hooks": {
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /path/to/rex-mcp/dist/stdio.js close"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+If the systemd unit sets `REX_MCP_CONFIG`, put the same variable in the hook command so the hook reads the same ownership file. The hook is safe to install globally: outside a block rex-mcp created, and under the protected setups above, the command exits 2 and closes nothing. OpenCode and other agents run the same command from their own session-end hook, or as the last step of a one-shot task.
+
 ## Safety model
 
 - Reads are always allowed, on any session. `rex_capture` returns terminal
@@ -118,8 +183,12 @@ DESIGN.md describes each tool's arguments.
   that machine.
 - Writes need a target session that rex-mcp created or that `writeAllowlist`
   names. A write without a session is refused.
-- Sessions created through rex-mcp are owned. Ownership survives restarts
+- Sessions created through rex-mcp are owned. Blocks it creates are recorded
+  too, including blocks in an allowlisted session. Ownership survives restarts
   through `stateFile`.
+- `rex-mcp close` only closes the block it is running in, and only when that
+  block or its session was created by rex-mcp. It never touches `wispy-fjord`,
+  a `claude-rc` tmux session, or anything under `claude --remote-control`.
 - Server, host, Tailscale and client-control API methods are blocked unless
   `unblockMethods` lists them.
 - Lua (`allowLua`) and actions performed by a connected Rex app
@@ -144,20 +213,25 @@ Unknown fields are rejected.
 | `unblockMethods` | `[]` | Blocked API methods to allow, such as `server.stop`. Patterns ending in `.*` match a prefix. |
 | `allowLua` | `false` | Allow `rex_action_do` with `script`, and init.lua actions. |
 | `allowClientActions` | `false` | Allow actions performed by a connected Rex app, and `client.perform`. |
-| `stateFile` | `.state/owned.json` | Where the set of created sessions is kept. Relative paths resolve against the repo directory. |
+| `stateFile` | `.state/owned.json` | Where created sessions and blocks are kept. Relative paths resolve against the repo directory. |
+| `protectedSessionLabels` | `[]` | Extra session labels `rex-mcp close` refuses. `wispy-fjord` is always refused, on top of this list. |
 | `rexPath` | `rex` | The `rex` executable. |
 | `server` | unset | Passed as `rex -S SERVER`. Unset means the local server. |
 
 ## Test
 
 ```sh
-npm run build && npm test
+npm test
 ```
 
-The test needs a running Rex server. It creates a session named
-`rex-mcp-test-<random>`, runs every tool against it and kills it at the end.
-It checks that sessions that existed before are unchanged and that writes to
-them are refused.
+`npm test` builds, runs the unit tests, then the integration test. The unit
+tests need no Rex server. The integration test does: it creates a session
+named `rex-mcp-test-<random>`, runs every tool against it and kills it at the
+end. It checks that a waited `rex_run` returns output and closes its block,
+that `keep_open` leaves the block, that `rex-mcp close` removes a block this
+server created, and that the same command refuses a session that already
+existed. It checks that those pre-existing sessions are unchanged and that
+writes to them are refused.
 
 ## License
 

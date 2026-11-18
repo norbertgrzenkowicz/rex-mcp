@@ -14,6 +14,7 @@ const ConfigSchema = z
     stateFile: z.string().default(".state/owned.json"),
     rexPath: z.string().default("rex"),
     server: z.string().optional(),
+    protectedSessionLabels: z.array(z.string()).default([]),
   })
   .strict();
 
