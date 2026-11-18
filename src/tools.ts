@@ -1,6 +1,7 @@
 import { z, type ZodRawShape } from "zod";
 import type { Config } from "./config.js";
 import type { EventLog } from "./events.js";
+import { effectiveProtectedLabels } from "./close.js";
 import { parseBlockId, parseSessionId, type BlockId, type SessionId } from "./ids.js";
 import { classifyBlockMethod, classifyMethod } from "./methods.js";
 import type { Ownership } from "./ownership.js";
@@ -105,14 +106,96 @@ interface CaptureOptions {
   max_bytes?: number;
 }
 
-async function capture(ctx: Ctx, o: CaptureOptions): Promise<string> {
-  const args = ["capture", ...scope(ctx), "--trim", `--format=${o.format ?? "text"}`, ...(o.unwrap ? ["--unwrap"] : [])];
-  let text = await ctx.rex.run(args);
+async function captureAt(rex: RexCli, session: SessionId, block: BlockId | undefined, o: CaptureOptions): Promise<string> {
+  const args = [
+    "capture", "-s", session, ...(block ? ["-b", block] : []),
+    "--trim", `--format=${o.format ?? "text"}`, ...(o.unwrap ? ["--unwrap"] : []),
+  ];
+  let text = await rex.run(args);
   if (o.tail_lines !== undefined) text = text.replace(/\n$/, "").split("\n").slice(-o.tail_lines).join("\n");
   const bytes = Buffer.from(text);
   const max = o.max_bytes ?? 200_000;
   if (bytes.length <= max) return text;
   return `[rex-mcp: truncated ${bytes.length - max} bytes from the front]\n${bytes.subarray(bytes.length - max).toString()}`;
+}
+
+async function capture(ctx: Ctx, o: CaptureOptions): Promise<string> {
+  return captureAt(ctx.rex, requireSession(ctx), ctx.target.block, o);
+}
+
+export interface RunCreated {
+  block_ids?: string[];
+  window_id?: string;
+}
+
+/** Rex writes the creation JSON, then waits. A second line, if any, is not the creation result. */
+export function parseRunCreated(stdout: string): RunCreated | undefined {
+  const trimmed = stdout.trim();
+  if (!trimmed) return undefined;
+  for (const candidate of [trimmed, trimmed.split("\n")[0] ?? ""]) {
+    try {
+      const value = JSON.parse(candidate) as RunCreated;
+      if (value && typeof value === "object") return value;
+    } catch {
+      // try the other shape
+    }
+  }
+  return undefined;
+}
+
+export function rexRunArgs(input: {
+  session: string;
+  block?: string;
+  cwd?: string;
+  split?: string;
+  ratio?: number;
+  label?: string;
+  keepOpen?: boolean;
+  wait?: boolean;
+  command: readonly string[];
+}): string[] {
+  return [
+    "run", "--json", "--focus=false", "-s", input.session,
+    ...(input.block ? ["-b", input.block] : []),
+    ...(input.cwd ? ["-c", input.cwd] : []),
+    ...(input.split ? [`--split=${input.split}`] : []),
+    ...(input.ratio !== undefined ? ["--ratio", String(input.ratio)] : []),
+    ...(input.label ? ["--label", input.label] : []),
+    // A waited run holds the block open so its output can be captured, then closes it.
+    ...(input.keepOpen || input.wait ? ["--keep-open"] : []),
+    ...(input.wait ? ["--wait"] : []),
+    "--",
+    ...input.command,
+  ];
+}
+
+function rememberBlocks(ctx: Ctx, session: SessionId, ids: readonly string[] | undefined): void {
+  for (const id of ids ?? []) {
+    if (id.startsWith("block:")) ctx.owned.addBlock(parseBlockId(id), session);
+  }
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+async function closeCreated(ctx: Ctx, session: SessionId, created: RunCreated, closeWindow: boolean): Promise<void> {
+  const ids = (created.block_ids ?? []).filter((id) => id.startsWith("block:"));
+  for (const id of ids) {
+    await ctx.rex.run(["block", "close", "-s", session, id]);
+    ctx.owned.removeBlock(parseBlockId(id));
+  }
+  // block.close already closes a window whose last block went away. If Rex left
+  // the window behind, close it only when nothing else is still in it. A
+  // failure here does not undo the block close.
+  if (!closeWindow || !created.window_id?.startsWith("window:")) return;
+  try {
+    const { blocks } = await ctx.rex.json<{ blocks: { window_id?: string }[] }>(["block", "ls", "-s", session, "--json"]);
+    if (blocks.some((b) => b.window_id === created.window_id)) return;
+    await ctx.rex.run(["window", "close", "-s", session, created.window_id]);
+  } catch {
+    // The window already closed with its last block.
+  }
 }
 
 async function waitExit(ctx: Ctx, block: BlockId, timeoutSeconds: number) {
@@ -146,7 +229,15 @@ export const tools: Tool[] = [
         whoami,
         version,
         owned: ctx.owned.list(),
-        policy: { writeAllowlist, unblockMethods, allowLua, allowClientActions, server: server ?? "local" },
+        blocks: ctx.owned.listBlocks(),
+        policy: {
+          writeAllowlist,
+          unblockMethods,
+          allowLua,
+          allowClientActions,
+          server: server ?? "local",
+          protectedSessionLabels: effectiveProtectedLabels(ctx.config.protectedSessionLabels),
+        },
       };
     },
   }),
@@ -234,7 +325,7 @@ export const tools: Tool[] = [
   tool({
     name: "rex_run",
     description:
-      "Run a command in a new block (new window, or a split beside `anchor_block`). Never takes focus. With `wait_seconds`, also waits for the command to exit.",
+      "Run a command in a new block (a new window, or a split beside `anchor_block`). Never takes focus. With `wait_seconds`, wait until the command exits, return its screen as `output`, and close the block (and its window, when this block was the only one). That is the default for a one-off command. Set `keep_open` true to leave the block up after it exits, for a dev server or an interactive agent. If the wait times out, the program is still running and the block stays open; close it with rex_block_close if you are done with it. Without `wait_seconds` the call returns once the block exists and does not close it. Rex closes that block when the program exits, unless `keep_open` is true. Nothing is closed for being idle. A long-lived program closes its own block when it finishes by running `rex-mcp close` (see the README). That command refuses wispy-fjord, tmux session claude-rc, and claude --remote-control.",
     access: "write-session",
     input: {
       session: session.optional(),
@@ -248,31 +339,65 @@ export const tools: Tool[] = [
       wait_seconds: z.number().positive().max(3600).optional(),
     },
     async handler(a, ctx) {
-      const args = [
-        "run", "--json", "--focus=false", "-s", requireSession(ctx),
-        ...(ctx.target.block ? ["-b", ctx.target.block] : []),
-        ...(a.cwd ? ["-c", a.cwd] : []),
-        ...(a.split ? [`--split=${a.split}`] : []),
-        ...(a.ratio ? ["--ratio", String(a.ratio)] : []),
-        ...(a.label ? ["--label", a.label] : []),
-        ...(a.keep_open ? ["--keep-open"] : []),
-      ];
-      if (a.wait_seconds === undefined) return ctx.rex.json([...args, "--", ...a.command]);
-      const full = [...args, "--wait", "--", ...a.command];
-      const r = await ctx.rex.exec(full, { timeoutMs: a.wait_seconds * 1000 });
-      let created: unknown;
-      try {
-        created = JSON.parse(r.stdout);
-      } catch {
-        throw new RexError(full, r.code, r.stderr, r.stdout);
+      const session = requireSession(ctx);
+      const argv = rexRunArgs({
+        session,
+        block: ctx.target.block,
+        cwd: a.cwd,
+        split: a.split,
+        ratio: a.ratio,
+        label: a.label,
+        keepOpen: a.keep_open,
+        wait: a.wait_seconds !== undefined,
+        command: a.command,
+      });
+      if (a.wait_seconds === undefined) {
+        const created = await ctx.rex.json<RunCreated>(argv);
+        if (created?.block_ids) rememberBlocks(ctx, session, created.block_ids);
+        return created ? { ...created, closed: false } : created;
       }
-      const wait = r.timedOut ? { done: false, timed_out: true } : { done: true, timed_out: false, exit_code: r.code };
-      return { ...(created as object), wait };
+      const r = await ctx.rex.exec(argv, { timeoutMs: a.wait_seconds * 1000 });
+      const created = parseRunCreated(r.stdout);
+      if (!created) throw new RexError(argv, r.code, r.stderr, r.stdout);
+      rememberBlocks(ctx, session, created.block_ids);
+      const blockId = created.block_ids?.find((id) => id.startsWith("block:"));
+      let output: string | undefined;
+      let captureError: string | undefined;
+      if (blockId) {
+        try {
+          output = await captureAt(ctx.rex, session, parseBlockId(blockId), { unwrap: true });
+        } catch (err) {
+          captureError = errorText(err);
+        }
+      }
+      let closed = false;
+      let closeError: string | undefined;
+      // A timeout means the program is still running. Leave it. keep_open leaves it after exit too.
+      if (!r.timedOut && a.keep_open !== true) {
+        try {
+          await closeCreated(ctx, session, created, !a.split);
+          closed = true;
+        } catch (err) {
+          closeError = errorText(err);
+        }
+      }
+      const wait = r.timedOut
+        ? { done: false as const, timed_out: true as const }
+        : { done: true as const, timed_out: false as const, exit_code: r.code };
+      return {
+        ...created,
+        output,
+        ...(captureError ? { capture_error: captureError } : {}),
+        closed,
+        ...(closeError ? { close_error: closeError } : {}),
+        wait,
+      };
     },
   }),
   tool({
     name: "rex_session_create",
-    description: "Create a session (rex new). rex-mcp owns it, so it may write to it. Returns its ID and first block ID.",
+    description:
+      "Create a session (rex new). rex-mcp owns it, so it may write to it. Returns its ID and first block ID. The session stays up for as long as its programs do; it is not closed for being idle. Prefer rex_run with wait_seconds for a one-off command, which closes that block when the command exits. A program in this session can close its own block when it finishes by running `rex-mcp close`.",
     access: "create",
     input: {
       label: z.string().optional(),
@@ -292,6 +417,7 @@ export const tools: Tool[] = [
       ]);
       const id = parseSessionId(created.session_id);
       ctx.owned.add(id);
+      for (const window of created.initial_windows) rememberBlocks(ctx, id, window.block_ids);
       const first = created.initial_windows[0];
       return { ...created, session_id: id, window_id: first?.window_id, block_id: first?.block_ids[0] };
     },
@@ -310,7 +436,8 @@ export const tools: Tool[] = [
   }),
   tool({
     name: "rex_block_close",
-    description: "Close a block and end its program (rex block close).",
+    description:
+      "Close a block and end its program (rex block close). Rex closes the window too when that was its last block. Never closes a block for being idle, and never closes any other block.",
     access: "write-session",
     input: { session: session.optional(), block },
     async handler(_, ctx) {
@@ -409,7 +536,12 @@ export const tools: Tool[] = [
         ["api", "call", ...(ctx.target.session ? ["-s", ctx.target.session.id] : []), method, "-"],
         { stdin: JSON.stringify(args ?? {}) },
       );
-      if (rule === "create" && result?.session_id) ctx.owned.add(parseSessionId(result.session_id));
+      if (rule === "create" && result?.session_id) {
+        const id = parseSessionId(result.session_id);
+        ctx.owned.add(id);
+        const windows = (result as { initial_windows?: { block_ids?: string[] }[] }).initial_windows;
+        for (const window of windows ?? []) rememberBlocks(ctx, id, window.block_ids);
+      }
       return result;
     },
   }),

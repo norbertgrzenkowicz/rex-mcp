@@ -35,14 +35,20 @@ same core and passes a different `Caller`. No other file changes.
   per-caller rules can be added later without changing tool signatures.
 - `Config` holds `writeAllowlist: string[]` (session IDs or labels),
   `unblockMethods: string[]`, `allowLua: boolean`, `allowClientActions:
-  boolean`, `stateFile: string`, `rexPath: string` and `server?: string`. The
+  boolean`, `stateFile: string`, `rexPath: string`, `server?: string` and
+  `protectedSessionLabels: string[]` (extra labels `rex-mcp close` refuses;
+  `wispy-fjord` is always refused). The
   `server` field is the hook for `-S HOST`. It is unset by default, which means
   the local server. The file is `$REX_MCP_CONFIG` if set, otherwise
   `rex-mcp.config.json` in this directory. A missing default file means all
   defaults. A relative `stateFile` resolves against this directory.
-- `Ownership` is a set of `SessionId`. It is written to `stateFile` (default
-  `.state/owned.json` in this directory) after each change, so ownership
-  survives a restart. Destroyed sessions are pruned when they are seen gone.
+- `Ownership` is the set of `SessionId`s this server created, plus the blocks
+  it created (`{id, session}`, including a block in an allowlisted session).
+  It is written to `stateFile` (default `.state/owned.json`) after each
+  change, so ownership survives a restart. A file that is still a JSON array
+  of session IDs is read as sessions with no recorded blocks. Destroyed
+  sessions are pruned when they are seen gone, and blocks whose session is
+  gone are dropped with them.
 - `EventLog` is a ring buffer of `{ seq: number, at: string, event: unknown }`
   with capacity 5000. `seq` increases by one per event. `poll(cursor, waitMs,
   filter)` returns the events after `cursor` and the next cursor. If none are
@@ -102,7 +108,7 @@ Rex pane, the CLI cannot fall back to that pane's session.
 | `rex_block_info` | read | `rex block inspect` and the terminal `process` method. |
 | `rex_send_text` | write-session | `rex send`, with the text passed on stdin. Optional `enter: true` presses Return afterwards. |
 | `rex_send_keys` | write-session | `rex send-key KEY...`. |
-| `rex_run` | write-session | `rex run --json --focus=false`. `command` is an argv array. Options are `cwd`, `split`, `anchor_block`, `ratio`, `label`, `keep_open` and `wait_seconds`. With `wait_seconds`, it runs `rex run --wait` and stops that CLI at the deadline. A separate `rex wait` would race a pane that closes when its program exits. |
+| `rex_run` | write-session | `rex run --json --focus=false`. `command` is an argv array. Options are `cwd`, `split`, `anchor_block`, `ratio`, `label`, `keep_open` and `wait_seconds`. With `wait_seconds`, it runs `rex run --wait --keep-open` (so the block is still there to read), captures the screen, and closes the block unless `keep_open` is true. Rex closes a window whose last block closed. A non-split run then closes that window only if `block ls` shows nothing left in it. A split is `rex block close` only, so the anchor stays. A timeout stops the waiter and leaves the block running. Without `wait_seconds`, Rex closes the block when the command exits unless `keep_open` is set. The created block ids are recorded. |
 | `rex_session_create` | create | `rex new LABEL --json`, with optional `cwd`, `window` and `command`. Returns the session ID and the first block ID. |
 | `rex_session_kill` | write-session | `rex kill SESSION_ID`. Removes it from Ownership. |
 | `rex_block_close` | write-session | `rex block close`. |
@@ -117,6 +123,44 @@ Rex pane, the CLI cannot fall back to that pane's session.
 The server never passes `--focus=true`. It never uses client actions unless
 config enables them.
 
+## Closing what this server opened
+
+Idle time never closes a block. A block closes when its program exits (Rex's
+own rule, unless `keep_open`), when a waited `rex_run` finishes and
+`keep_open` is not set, or when the creator closes it.
+
+`rex-mcp close` (the same binary as the server, with the argument `close`) is
+how a program running inside a block closes that block. It reads `REX_SESSION`
+and `REX_BLOCK` and takes no target argument. Before it talks to Rex it
+refuses if a parent is `claude --remote-control` / `claude remote-control`, or
+if it is under tmux session `claude-rc`. After a read-only `rex ls` it also
+refuses session label `wispy-fjord` (always, plus any
+`protectedSessionLabels`), a session that is not on the server, and a block
+that is neither in an owned session nor in the recorded block set. An owned
+session's last block takes the session with it (`rex kill`). Any other
+allowed block is `rex block close` only. An allowlisted session is never
+killed.
+
+A Claude Code `SessionEnd` hook is the documented way to run it. `Stop` fires
+after every turn and would close a block the agent is still using.
+
+## Processes
+
+This server does not spawn `wl-copy` or `wl-paste`. Every `rex` child has a
+`close` handler, which is what reaps it, so a child that exits does not stay a
+zombie of rex-mcp. `exec` starts that child as its own process group. On
+timeout the group gets SIGTERM and then SIGKILL, so a grandchild the CLI
+forked cannot outlive the wait.
+
+Orphaned `wl-copy --primary` processes are the Wayland primary-selection
+helper. `wl-copy` forks itself into the background and serves the selection
+until something replaces it; its parent is whatever asked to copy (the Rex
+Linux client, a terminal clipboard hook, or a shell integration), not this
+server. Closing a block goes through `rex block close`, which hangs the
+terminal up. It does not scan the process table and it does not signal
+processes in sessions this server does not own. A zombie whose parent is the
+Rex server, rather than this Node process, is outside what rex-mcp can reap.
+
 ## Errors
 
 `RexCli` parses JSON at the boundary. A non-zero exit becomes `RexError` with
@@ -126,7 +170,9 @@ twice.
 
 ## Test
 
-`npm test` runs `test/integration.ts`. It starts `dist/stdio.js` with the SDK
+`npm test` builds, runs `test/cleanup.test.ts` (no Rex server: close decisions,
+ownership, `rex_run` cleanup, and process-group kill), then `test/integration.ts`.
+The integration test starts `dist/stdio.js` with the SDK
 `Client` and `StdioClientTransport`, creates `rex-mcp-test-<rand>`, runs every
 tool against it, and kills it in `finally`. It snapshots every session that
 exists before the test (session IDs, labels, window and block IDs, labels)

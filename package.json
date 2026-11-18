@@ -27,7 +27,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/stdio.js",
-    "test": "tsx test/integration.ts",
+    "test": "npm run build && tsx --test test/cleanup.test.ts && tsx test/integration.ts",
+    "test:unit": "tsx --test test/cleanup.test.ts",
     "prepare": "npm run build"
   },
   "engines": {

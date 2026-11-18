@@ -23,6 +23,8 @@ export class RexError extends Error {
 export interface ExecOptions {
   stdin?: string;
   timeoutMs?: number;
+  /** How long to wait after SIGTERM before SIGKILL of the process group. */
+  sigkillAfterMs?: number;
 }
 
 export class RexCli {
@@ -31,32 +33,54 @@ export class RexCli {
     private readonly server?: string,
   ) {}
 
-  private spawn(args: readonly string[]): ChildProcessWithoutNullStreams {
+  private spawn(args: readonly string[], detached = false): ChildProcessWithoutNullStreams {
     const env = { ...process.env };
     for (const name of LOCATION_VARS) delete env[name];
     const argv = this.server ? ["-S", this.server, ...args] : [...args];
-    return spawn(this.path, argv, { env, stdio: ["pipe", "pipe", "pipe"] });
+    return spawn(this.path, argv, { env, stdio: ["pipe", "pipe", "pipe"], detached });
   }
 
   exec(args: readonly string[], opts: ExecOptions = {}): Promise<ExecResult> {
     return new Promise((resolve, reject) => {
-      const child = this.spawn(args);
+      // Own process group so a timed-out CLI cannot leave a forked child behind.
+      const child = this.spawn(args, true);
       let stdout = "";
       let stderr = "";
       let timedOut = false;
+      let settled = false;
+      const killGroup = (sig: NodeJS.Signals) => {
+        const pid = child.pid;
+        if (!pid) return;
+        try {
+          process.kill(-pid, sig);
+        } catch {
+          try {
+            child.kill(sig);
+          } catch {
+            // already reaped
+          }
+        }
+      };
+      let killTimer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (killTimer) clearTimeout(killTimer);
+        fn();
+      };
+      child.stdin.on("error", () => {});
       child.stdout.setEncoding("utf8").on("data", (d: string) => (stdout += d));
       child.stderr.setEncoding("utf8").on("data", (d: string) => (stderr += d));
       const timer = setTimeout(() => {
         timedOut = true;
-        child.kill("SIGTERM");
+        killGroup("SIGTERM");
+        killTimer = setTimeout(() => killGroup("SIGKILL"), opts.sigkillAfterMs ?? 2_000);
       }, opts.timeoutMs ?? 30_000);
-      child.on("error", (err) => {
-        clearTimeout(timer);
-        reject(err);
-      });
+      child.on("error", (err) => finish(() => reject(err)));
       child.on("close", (code) => {
-        clearTimeout(timer);
-        resolve({ code, stdout, stderr, timedOut });
+        if (timedOut) killGroup("SIGKILL");
+        finish(() => resolve({ code, stdout, stderr, timedOut }));
       });
       child.stdin.end(opts.stdin ?? "");
     });
